@@ -64,13 +64,30 @@ class MediaWatcher(QObject):
 
     async def _main(self):
         from winrt.windows.media.control import (
-            GlobalSystemMediaTransportControlsSessionManager as Manager,
+            GlobalSystemMediaTransportControlsSessionManager,
         )
-        self._mgr = await Manager.request_async()
+        self._mgr = await GlobalSystemMediaTransportControlsSessionManager.request_async()
         self._ready.set()
         log.info("SMTC manager ready")
+        empty_polls = 0
+        last_count = -1
         while True:
             try:
+                count = len(list(self._mgr.get_sessions()))
+                if count != last_count:
+                    log.info("SMTC sessions: %d", count)
+                    last_count = count
+                if count == 0:
+                    empty_polls += 1
+                    # 已知坑：部分 Windows 构建上，音乐开始播放之前
+                    # 请求的 Manager 不会刷新会话列表，空转 20 秒后重建
+                    if empty_polls % 20 == 0:
+                        log.info("no sessions for a while, re-request manager")
+                        self._mgr = await (
+                            GlobalSystemMediaTransportControlsSessionManager
+                            .request_async())
+                else:
+                    empty_polls = 0
                 await self._poll()
             except Exception as e:
                 log.debug("poll error: %s", e)

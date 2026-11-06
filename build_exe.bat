@@ -9,6 +9,7 @@ cd /d "%~dp0"
 python -m PyInstaller --noconfirm ^
   --name DynamicIsland ^
   --windowed ^
+  --icon icon.ico ^
   --distpath dist2 ^
   --workpath build2 ^
   --hidden-import winrt.windows.media.control ^

@@ -32,9 +32,22 @@ class MailWorker(QObject):
     def __init__(self, conf: dict):
         super().__init__()
         self.conf = dict(conf)
-        self._thread = None
+        self._threads = []
         self._stop = threading.Event()
-        self._seen_ids = set()
+        self._seen = {}                # 邮箱账号 -> 已处理邮件id集合（多账户各自去重）
+        self._lock = threading.Lock()
+
+    def _accounts(self) -> list:
+        """取出所有配置完整的邮箱账户（兼容旧的单账户字段）"""
+        imap = self.conf
+        accts = list(imap.get("accounts") or [])
+        if not accts and imap.get("host"):
+            accts = [{"host": imap.get("host"),
+                      "port": imap.get("port", 993),
+                      "user": imap.get("user"),
+                      "password": imap.get("password")}]
+        return [a for a in accts
+                if a.get("host") and a.get("user") and a.get("password")]
 
     def update_conf(self, conf: dict):
         """配置变更后调用，自动重启轮询"""
@@ -43,24 +56,30 @@ class MailWorker(QObject):
         self.start()
 
     def start(self):
-        c = self.conf
-        if not c.get("host") or not c.get("user") or not c.get("password"):
+        accts = self._accounts()
+        if not accts:
             log.info("邮箱未配置，验证码监听不启动")
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._threads = []
+        for a in accts:
+            t = threading.Thread(target=self._run, args=(a,), daemon=True)
+            t.start()
+            self._threads.append(t)
+        log.info("邮件监听账户数: %d", len(accts))
 
     def stop(self):
         self._stop.set()
+        self._threads = []
 
     # ---------- 后台轮询 ----------
 
-    def _run(self):
+    def _run(self, acct: dict):
         interval = max(8, int(self.conf.get("interval", 15)))
-        log.info("邮件监听启动: %s as %s (每%ds)", self.conf["host"], self.conf["user"], interval)
+        log.info("邮件监听启动: %s as %s (每%ds)",
+                 acct["host"], acct["user"], interval)
         while not self._stop.is_set():
-            ok, msg = self._check_once()
+            ok, msg = self._check_once(acct)
             if ok:
                 self.statusChanged.emit("ok")
             else:
@@ -70,21 +89,21 @@ class MailWorker(QObject):
                 continue
             self._stop.wait(interval)
 
-    def _connect(self):
-        host = self.conf["host"]
-        port = int(self.conf.get("port", 993))
+    def _connect(self, acct: dict):
+        host = acct["host"]
+        port = int(acct.get("port", 993))
         if port == 143:
             M = imaplib.IMAP4(host, port)
             M.starttls()
         else:
             M = imaplib.IMAP4_SSL(host, port)
-        M.login(self.conf["user"], self.conf["password"])
+        M.login(acct["user"], acct["password"])
         return M
 
-    def _check_once(self):
+    def _check_once(self, acct: dict):
         M = None
         try:
-            M = self._connect()
+            M = self._connect(acct)
             M.select("INBOX", readonly=True)
             # IMAP SEARCH 只支持日期粒度，取最近 1 天再本地按时间过滤
             since = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
@@ -93,9 +112,11 @@ class MailWorker(QObject):
                 return True, None
             ids = data[0].split()[-10:]  # 最近 10 封，从新到旧处理
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+            with self._lock:
+                seen = self._seen.setdefault(acct["user"], set())
 
             for mid in reversed(ids):
-                if mid.decode() in self._seen_ids:
+                if mid.decode() in seen:
                     continue
                 typ, msg_data = M.fetch(mid, "(RFC822)")
                 if typ != "OK":
@@ -104,7 +125,7 @@ class MailWorker(QObject):
                 msg = email.message_from_bytes(raw)
 
                 msg_id = (msg.get("Message-ID") or mid.decode()).strip()
-                self._seen_ids.add(mid.decode())
+                seen.add(mid.decode())
 
                 # 解析邮件时间，超过 15 分钟的旧邮件不提示
                 try:

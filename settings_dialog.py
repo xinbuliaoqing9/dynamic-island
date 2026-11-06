@@ -14,7 +14,8 @@ import sys
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QTabWidget, QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 CONFIG_PATH = os.path.join(
@@ -30,11 +31,12 @@ DEFAULT_CONF = {
         "mail": False,        # 邮箱验证码（默认关，需配置邮箱）
     },
     "imap": {
-        "host": "",           # 如 imap.qq.com / imap.163.com
+        "host": "",           # 旧单账户字段（保留兼容，新配置走 accounts）
         "port": 993,
         "user": "",           # 邮箱完整地址
         "password": "",       # 授权码（不是登录密码）
         "interval": 15,       # 轮询间隔（秒）
+        "accounts": [],       # 多邮箱账户：[{host,port,user,password}, ...]
     },
     "ui": {
         "y": 12,              # 距屏幕顶部像素
@@ -118,29 +120,70 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         return w
 
-    # ---------- Tab 2：邮箱配置 ----------
+    # ---------- Tab 2：邮箱配置（支持多邮箱） ----------
 
     def _build_mail_tab(self) -> QWidget:
         w = QWidget()
-        form = QFormLayout(w)
-        m = self.conf["imap"]
+        lay = QVBoxLayout(w)
+        tip = QLabel("可同时监听多个邮箱（如 QQ + 163），每个邮箱各填一行：")
+        tip.setStyleSheet("color:#555; font-size:12px;")
+        lay.addWidget(tip)
 
-        self.ed_host = QLineEdit(m.get("host", ""))
-        self.ed_host.setPlaceholderText("imap.qq.com")
-        self.ed_port = QLineEdit(str(m.get("port", 993)))
-        self.ed_user = QLineEdit(m.get("user", ""))
-        self.ed_user.setPlaceholderText("你的邮箱完整地址")
-        self.ed_pwd = QLineEdit(m.get("password", ""))
-        self.ed_pwd.setEchoMode(QLineEdit.Password)
-        self.ed_pwd.setPlaceholderText("授权码（非登录密码）")
-        self.ed_interval = QLineEdit(str(m.get("interval", 15)))
+        # 兼容旧配置：无 accounts 时把旧单账户字段填入第一行
+        imap = self.conf["imap"]
+        rows = list(imap.get("accounts") or [])
+        if not rows and imap.get("host"):
+            rows = [{"host": imap.get("host", ""),
+                     "port": imap.get("port", 993),
+                     "user": imap.get("user", ""),
+                     "password": imap.get("password", "")}]
 
-        form.addRow("IMAP 服务器", self.ed_host)
-        form.addRow("端口", self.ed_port)
-        form.addRow("邮箱账号", self.ed_user)
-        form.addRow("授权码", self.ed_pwd)
-        form.addRow("轮询间隔(秒)", self.ed_interval)
+        self.tbl = QTableWidget(0, 5)
+        self.tbl.setHorizontalHeaderLabels(
+            ["备注", "IMAP服务器", "端口", "邮箱账号", "授权码"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setColumnWidth(0, 70)
+        self.tbl.setColumnWidth(1, 130)
+        self.tbl.setColumnWidth(2, 55)
+        self.tbl.setColumnWidth(3, 170)
+        for r in rows:
+            self._add_row(r)
+        lay.addWidget(self.tbl)
+
+        btns = QHBoxLayout()
+        btn_add = QPushButton("＋ 添加邮箱")
+        btn_add.clicked.connect(lambda: self._add_row(
+            {"name": "", "host": "imap.qq.com", "port": 993,
+             "user": "", "password": ""}))
+        btn_del = QPushButton("－ 删除选中行")
+        btn_del.clicked.connect(self._del_row)
+        btns.addWidget(btn_add)
+        btns.addWidget(btn_del)
+        btns.addStretch()
+        lay.addLayout(btns)
+
+        form = QHBoxLayout()
+        form.addWidget(QLabel("轮询间隔(秒)"))
+        self.ed_interval = QLineEdit(str(imap.get("interval", 15)))
+        self.ed_interval.setMaximumWidth(70)
+        form.addWidget(self.ed_interval)
+        form.addStretch()
+        lay.addLayout(form)
         return w
+
+    def _add_row(self, acct: dict):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        vals = [acct.get("name", ""), acct.get("host", ""),
+                str(acct.get("port", 993)), acct.get("user", ""),
+                acct.get("password", "")]
+        for c, v in enumerate(vals):
+            self.tbl.setItem(r, c, QTableWidgetItem(v))
+
+    def _del_row(self):
+        rows = {i.row() for i in self.tbl.selectedIndexes()}
+        for r in sorted(rows, reverse=True):
+            self.tbl.removeRow(r)
 
     # ---------- Tab 3：帮助 ----------
 
@@ -149,6 +192,8 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(w)
         txt = QLabel(
             "【常见邮箱授权码获取方法】\n\n"
+            "· 支持同时监听多个邮箱：在「邮箱配置」页点「＋ 添加邮箱」，\n"
+            "   QQ 和 163 各填一行即可，哪个先收到就提醒哪个\n\n"
             "· QQ邮箱：网页版 → 设置 → 账户 → 开启 IMAP/SMTP 服务 → 生成授权码\n"
             "   IMAP服务器填 imap.qq.com，端口 993\n\n"
             "· 163邮箱：网页版 → 设置 → POP3/IMAP/SMTP → 开启并获取授权码\n"
@@ -186,24 +231,41 @@ class SettingsDialog(QDialog):
         self.conf["features"]["mail"] = self.cb_mail.isChecked()
 
         imap = self.conf["imap"]
-        imap["host"] = self.ed_host.text().strip()
-        try:
-            imap["port"] = int(self.ed_port.text().strip() or "993")
-        except ValueError:
-            imap["port"] = 993
-        imap["user"] = self.ed_user.text().strip()
-        imap["password"] = self.ed_pwd.text()
+        # 读取表格里的所有邮箱账户
+        accounts = []
+        for r in range(self.tbl.rowCount()):
+            def cell(rr, cc):
+                it = self.tbl.item(rr, cc)
+                return (it.text().strip() if it else "")
+            acct = {
+                "name": cell(r, 0),
+                "host": cell(r, 1),
+                "port": 993,
+                "user": cell(r, 3),
+                "password": cell(r, 4),
+            }
+            try:
+                acct["port"] = int(cell(r, 2) or "993")
+            except ValueError:
+                pass
+            if acct["host"] and acct["user"]:
+                accounts.append(acct)
+        imap["accounts"] = accounts
+        # 同步旧单账户字段 = 第一个账户（兼容旧版本读取）
+        if accounts:
+            imap["host"] = accounts[0]["host"]
+            imap["port"] = accounts[0]["port"]
+            imap["user"] = accounts[0]["user"]
+            imap["password"] = accounts[0]["password"]
         try:
             imap["interval"] = max(8, int(self.ed_interval.text().strip() or "15"))
         except ValueError:
             imap["interval"] = 15
 
         # 校验：勾了邮箱功能但没配邮箱 → 提示但不强制
-        if self.conf["features"]["mail"] and not (
-            imap["host"] and imap["user"] and imap["password"]
-        ):
+        if self.conf["features"]["mail"] and not accounts:
             QMessageBox.warning(self, "邮箱未配置完整",
-                                "已勾选验证码功能，但 IMAP 信息不完整。\n"
+                                "已勾选验证码功能，但还没有添加邮箱账户。\n"
                                 "功能会开启，但在配置好之前不会收到提醒。")
         save_conf(self.conf)
         self.accept()

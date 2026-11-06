@@ -50,7 +50,10 @@ os.makedirs(RUNTIME_DIR, exist_ok=True)
 STASH_DIR = os.path.join(RUNTIME_DIR, "stash")
 
 WIN_W, WIN_H = 414, 102         # 长度缩短1/3、高度加宽一半后的尺寸
-HIDE_PEEK = 6                   # 隐藏时露出屏幕顶部的像素（感应区）
+# 隐藏时露出屏幕顶部的像素。窗口自身有 6px 布局边距，胶囊内又有 6px
+# 光晕边距，胶囊主体从窗口顶部 12px 处才开始——所以至少要露 12px
+# 以上才能看到边线。取 20px = 可见约 8px 的霓虹描边（QQ 同款效果）。
+HIDE_PEEK = 20
 
 MODE_MUSIC, MODE_STASH, MODE_CODE, MODE_IDLE = 0, 1, 2, 3
 

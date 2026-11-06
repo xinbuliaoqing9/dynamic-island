@@ -38,6 +38,7 @@ class MediaWatcher(QObject):
         self._est_pos = 0.0            # 本地估算的播放进度（秒）
         self._est_ts = time.time()
         self._ready = threading.Event()
+        self._paused_since = 0.0       # 当前会话进入暂停的时刻（兜底超时用）
 
     # ---------- 对 UI 暴露的方法 ----------
 
@@ -94,22 +95,31 @@ class MediaWatcher(QObject):
             await asyncio.sleep(1)
 
     def _pick_session(self):
-        """挑一个有内容的媒体会话（优先音乐类）"""
+        """挑一个有内容且来源进程还活着的媒体会话（优先音乐类）。
+        播放器完全退出后 Windows 的 SMTC 会话可能残留，必须过滤掉，
+        否则岛会一直显示已退出播放器的旧歌曲信息。"""
         sessions = list(self._mgr.get_sessions())
         if not sessions:
             return None, None
-        # 优先选正在 Playing 的
         best = None
+        first_alive = None
         for s in sessions:
             try:
+                app_id = str(s.source_app_user_model_id or "")
                 pb = s.get_playback_info()
+                alive = _session_alive(app_id)
+                if not alive:
+                    log.info("drop stale session from %s (process gone)", app_id)
+                    continue
+                if first_alive is None:
+                    first_alive = s
                 if pb.playback_status == 4:  # PLAYING
                     best = s
                     break
             except Exception:
                 continue
         if best is None:
-            best = sessions[0]
+            best = first_alive
         return best, best.source_app_user_model_id if best else None
 
     async def _poll(self):
@@ -118,6 +128,22 @@ class MediaWatcher(QObject):
         )
 
         session, app_id = self._pick_session()
+
+        # 兜底：会话存在但长时间暂停（进程检测失败/特殊播放器），
+        # 超过 5 分钟视为已停止，避免岛上残留旧歌信息
+        if session is not None:
+            pb = session.get_playback_info()
+            if pb.playback_status == Status.PLAYING:
+                self._paused_since = 0.0
+            else:
+                if self._paused_since == 0.0:
+                    self._paused_since = time.time()
+                elif time.time() - self._paused_since > 300:
+                    log.info("session paused > 5min, treat as stopped")
+                    session = None
+        else:
+            self._paused_since = 0.0
+
         if session is None:
             if self._last_key != ("", ""):
                 self._last_key = ("", "")
@@ -217,6 +243,60 @@ class MediaWatcher(QObject):
                 await session.try_skip_next_async()
         except Exception as e:
             log.debug("control error: %s", e)
+
+
+# ---------------- 会话来源进程存活检测 ----------------
+
+# AUMID 包名 → 进程名关键字 的特例映射
+# （网易云的 AUMID 是 NeteaseCloudMusic，但实际进程叫 cloudmusic.exe）
+_AMID_ALIAS = {
+    "neteasecloudmusic": "cloudmusic",
+}
+
+_proc_cache = {"t": 0.0, "names": set()}
+
+
+def _norm(s: str) -> str:
+    """归一化：只留小写字母数字，去空格/下划线/横线/扩展名等差异"""
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def _proc_names() -> set:
+    """5 秒缓存的全部进程名集合，避免每秒全表枚举"""
+    now = time.time()
+    if now - _proc_cache["t"] > 5:
+        try:
+            import psutil
+            _proc_cache["names"] = {
+                (p.info["name"] or "") for p in psutil.process_iter(["name"])
+                if p.info["name"]
+            }
+        except Exception:
+            pass                      # 枚举失败沿用旧缓存
+        _proc_cache["t"] = now
+    return _proc_cache["names"]
+
+
+def _session_alive(app_id: str) -> bool:
+    """判断会话来源应用是否还在运行。
+    检测失败时一律返回 True（宁可多显示，不误杀正常会话）"""
+    try:
+        if not app_id:
+            return True
+        key = _norm(str(app_id).split("!")[0])
+        key = _AMID_ALIAS.get(key, key)
+        if not key:
+            return True
+        for name in _proc_names():
+            nk = _norm(name).removesuffix("exe")
+            if not nk:
+                continue
+            if key in nk or nk in key:
+                return True
+        log.info("source process not found: %s", app_id)
+        return False
+    except Exception:
+        return True
 
 
 def _cover_dir():

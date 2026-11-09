@@ -38,7 +38,7 @@ class MediaWatcher(QObject):
         self._est_pos = 0.0            # 本地估算的播放进度（秒）
         self._est_ts = time.time()
         self._ready = threading.Event()
-        self._paused_since = 0.0       # 当前会话进入暂停的时刻（兜底超时用）
+        self._paused_map = {}          # 会话id -> 首次观察到暂停的时刻（残留清理）
 
     # ---------- 对 UI 暴露的方法 ----------
 
@@ -111,6 +111,9 @@ class MediaWatcher(QObject):
                 if not alive:
                     log.info("drop stale session from %s (process gone)", app_id)
                     continue
+                if pb.playback_status == 0:  # CLOSED：浏览器关标签页后的残留
+                    log.info("drop closed session from %s", app_id)
+                    continue
                 if first_alive is None:
                     first_alive = s
                 if pb.playback_status == 4:  # PLAYING
@@ -128,21 +131,30 @@ class MediaWatcher(QObject):
         )
 
         session, app_id = self._pick_session()
+        now = time.time()
 
-        # 兜底：会话存在但长时间暂停（进程检测失败/特殊播放器），
-        # 超过 5 分钟视为已停止，避免岛上残留旧歌信息
+        # 残留会话清理（浏览器关闭标签页后 chrome.exe 进程还在，
+        # 进程检测无效，只能靠会话状态判断）：
+        #   1) 状态 CLOSED → 立即视为已停止
+        #   2) 长时间 PAUSED → 60 秒后视为已停止（每会话独立计时，
+        #      不会误伤其他暂停中的播放器）
         if session is not None:
+            sid = str(session.source_app_user_model_id or "")
             pb = session.get_playback_info()
-            if pb.playback_status == Status.PLAYING:
-                self._paused_since = 0.0
+            status = pb.playback_status
+            if status == Status.CLOSED:
+                log.info("session closed, drop: %s", sid)
+                session = None
+            elif status == Status.PLAYING:
+                self._paused_map.pop(sid, None)
             else:
-                if self._paused_since == 0.0:
-                    self._paused_since = time.time()
-                elif time.time() - self._paused_since > 300:
-                    log.info("session paused > 5min, treat as stopped")
+                t0 = self._paused_map.setdefault(sid, now)
+                if now - t0 > 60:
+                    log.info("session paused %.0fs, treat as stopped: %s",
+                             now - t0, sid)
                     session = None
         else:
-            self._paused_since = 0.0
+            self._paused_map.clear()
 
         if session is None:
             if self._last_key != ("", ""):
